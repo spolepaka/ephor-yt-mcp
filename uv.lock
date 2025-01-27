@@ -205,7 +205,7 @@ cli = [
 ]
 
 [[package]]
-name = "mcp-sse-client"
+name = "mcp-sse"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

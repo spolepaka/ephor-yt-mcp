@@ -1,7 +1,7 @@
 [project]
-name = "mcp-sse-client"
+name = "mcp-sse"
 version = "0.1.0"
-description = "Add your description here"
+description = "SSE-based MCP Server and Client"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
