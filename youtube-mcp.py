@@ -408,35 +408,22 @@ def signal_handler(sig, frame):
         sys.exit(0)
 
 
+# Create the Starlette app instance for Vercel
+app = create_starlette_app(mcp, debug=True)
+
 if __name__ == "__main__":
-    mcp_server = mcp._mcp_server  # noqa: WPS437
-    
-    parser = argparse.ArgumentParser(description='Run YouTube MCP SSE-based server')
-    parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=8080, help='Port to listen on')
+    parser = argparse.ArgumentParser(description="YouTube MCP Server")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=3000, help="Port to bind to")
     args = parser.parse_args()
 
-    # Register signal handlers for graceful shutdown
+    # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
-    print("YouTube Search MCP Server starting...")
-    print(f"Server running at http://{args.host}:{args.port}")
-    print("Use Ctrl+C to stop the server")
-    print("Client command: uv run client.py http://localhost:8080/sse")
-    print("Questions or feedback? Connect with @spolepaka/youtube-mcp | X: @skpolepaka")
-    
-    # Bind SSE request handling to MCP server
-    starlette_app = create_starlette_app(mcp_server, debug=True)
-    
-    # Create a Uvicorn config and server instance manually
-    config = uvicorn.Config(
-        app=starlette_app,
-        host=args.host,
-        port=args.port,
-        lifespan="on",
-        loop="asyncio",  # Explicitly set the event loop policy
-        timeout_keep_alive=5,  # Reduce keep-alive timeout for faster shutdown
-    )
+
+    # Configure and start Uvicorn server
+    config = uvicorn.Config(app, host=args.host, port=args.port)
     server = uvicorn.Server(config)
-    server.run()
+    
+    # Run the server
+    asyncio.run(server.serve())
