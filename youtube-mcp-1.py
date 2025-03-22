@@ -12,9 +12,20 @@ import uvicorn
 import argparse
 import signal
 import sys
+import asyncio
+from mcp.server.models import InitializationOptions
+from mcp.types import ServerCapabilities
+from contextlib import asynccontextmanager
 
 # Initialize FastMCP server for YouTube tools (SSE)
 mcp = FastMCP("youtube-search")
+
+# Global variable to hold the Uvicorn server instance
+server: uvicorn.Server | None = None
+
+# Global variables for shutdown coordination
+should_exit = False
+shutdown_event = asyncio.Event()
 
 # Constants
 COMMON_HEADERS = {
@@ -31,7 +42,6 @@ COMMON_HEADERS = {
     'Upgrade-Insecure-Requests': '1',
     'Cache-Control': 'max-age=0'
 }
-
 
 def extract_video_id(input_str: str) -> Optional[str]:
     """Extract YouTube video ID from URL or return the ID if already valid."""
@@ -336,22 +346,107 @@ async def get_transcript(input: str) -> str:
         return f"Error fetching transcript: {str(e)}"
 
 
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
-    """Create a Starlette application that can serve the provided mcp server with SSE."""
-    sse = SseServerTransport("/messages/")
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    """Handle Starlette lifespan events, specifically for graceful shutdown."""
+    # Track active connections
+    active_connections = set()
+    app.state.active_connections = active_connections
+    
+    # Startup logic
+    print("Server starting up...")
+    try:
+        yield
+    except Exception as e:
+        print(f"Error during server lifecycle: {e}")
+    finally:
+        # Shutdown logic
+        print("Server shutting down...")
+        try:
+            # Close all active connections
+            for connection in active_connections.copy():
+                try:
+                    await connection.close()
+                except Exception as e:
+                    print(f"Error closing connection: {e}")
+            
+            # Wait for shutdown event with timeout
+            try:
+                print("Waiting for pending tasks to complete...")
+                await asyncio.wait_for(shutdown_event.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                print("Shutdown wait timed out, forcing exit...")
+            except asyncio.CancelledError:
+                print("Shutdown cancelled, cleaning up...")
+            
+            # Cancel any remaining tasks
+            for task in asyncio.all_tasks():
+                if task is not asyncio.current_task():
+                    task.cancel()
+            
+            # Wait briefly for tasks to cancel
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*[
+                        task for task in asyncio.all_tasks()
+                        if task is not asyncio.current_task()
+                    ], return_exceptions=True),
+                    timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                print("Some tasks did not cancel in time")
+            
+        finally:
+            print("Shutdown complete.")
 
-    async def handle_sse(request: Request) -> None:
+
+async def handle_sse(request: Request) -> None:
+    """Handle SSE connections with proper cancellation handling."""
+    sse = SseServerTransport("/messages/")
+    
+    # Add connection to active set
+    app = request.app
+    active_connections = app.state.active_connections
+    active_connections.add(request)
+    
+    try:
         async with sse.connect_sse(
                 request.scope,
                 request.receive,
                 request._send,  # noqa: SLF001
         ) as (read_stream, write_stream):
-            await mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp_server.create_initialization_options(),
+            # Create proper initialization options with capabilities
+            init_options = InitializationOptions(
+                server_name="youtube-search",
+                server_version="1.0.0",
+                capabilities=ServerCapabilities()
             )
             
+            try:
+                await mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    init_options,
+                )
+            except asyncio.CancelledError:
+                print("SSE connection cancelled gracefully.")
+            except Exception as e:
+                print(f"Error in SSE connection: {e}")
+    except Exception as e:
+        print(f"Error establishing SSE connection: {e}")
+    finally:
+        # Remove connection from active set
+        active_connections.discard(request)
+        # Ensure connection is cleaned up
+        if hasattr(request, '_send'):
+            try:
+                await request._send({'type': 'http.disconnect'})
+            except Exception:
+                pass
+
+
+def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
+    """Create a Starlette application that can serve the provided mcp server with SSE."""
     # Create a router to handle root path
     async def root_handler(request: Request):
         from starlette.responses import HTMLResponse
@@ -378,6 +473,7 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
         </html>
         """)
 
+    sse = SseServerTransport("/messages/")
     return Starlette(
         debug=debug,
         routes=[
@@ -385,34 +481,90 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
         ],
+        lifespan=lifespan,
     )
 
 
-# Define signal handler for graceful shutdown
 def signal_handler(sig, frame):
-    print("\nShutting down server gracefully...")
-    sys.exit(0)
+    """Handle shutdown signals (SIGINT, SIGTERM) gracefully."""
+    global server
+    if shutdown_event.is_set():
+        print("\nForce exiting...")
+        sys.exit(1)
+        
+    print("\nReceived shutdown signal. Shutting down server gracefully...")
+    if server:
+        server.force_exit = True
+        server.should_exit = True
+        try:
+            # Signal the shutdown event in a thread-safe way
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(shutdown_event.set)
+            
+            # Give a brief moment for the shutdown to initiate
+            loop.call_later(5.0, lambda: sys.exit(1) if not server.should_exit else None)
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    mcp_server = mcp._mcp_server  # noqa: WPS437
-    
+    mcp_server = mcp._mcp_server  # Get the underlying server instance
+
     parser = argparse.ArgumentParser(description='Run YouTube MCP SSE-based server')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
     parser.add_argument('--port', type=int, default=8080, help='Port to listen on')
     args = parser.parse_args()
 
-    # Register signal handler for Ctrl+C
+    # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
-    
+    signal.signal(signal.SIGTERM, signal_handler)
+
     print("YouTube Search MCP Server starting...")
     print(f"Server running at http://{args.host}:{args.port}")
     print("Use Ctrl+C to stop the server")
     print("Client command: uv run client.py http://localhost:8080/sse")
-    print("Questions or feedback? Connect with @spolepaka/youtube-mcp | X: @skpolepaka")
     
+    # Add warning for port 3000 mismatch
+    if args.port != 3000:
+        print("\nNOTE: If you're using Cursor IDE's built-in MCP client:")
+        print("  - Cursor might be trying to connect on port 3000 by default")
+        print(f"  - Either update your Cursor MCP config to use port {args.port}")
+        print("  - Or restart this server with: uv run youtube-mcp.py --port 3000")
+        print("  - Config location: ~/.cursor/mcp.json")
+    
+    print("\nQuestions or feedback? Connect with @spolepaka/youtube-mcp | X: @skpolepaka")
+
     # Bind SSE request handling to MCP server
     starlette_app = create_starlette_app(mcp_server, debug=True)
+
+    # Configure and start Uvicorn server with minimal settings
+    config = uvicorn.Config(
+        app=starlette_app,
+        host=args.host,
+        port=args.port,
+        loop="asyncio",
+        timeout_keep_alive=5,
+        timeout_graceful_shutdown=3,
+        limit_max_requests=None,  # No request limit
+        access_log=False,  # Disable access logging for cleaner output
+    )
+    server = uvicorn.Server(config)
     
-    # Start server with custom signal handling
-    uvicorn.run(starlette_app, host=args.host, port=args.port, lifespan="on")
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        print("\nShutdown requested via KeyboardInterrupt...")
+        if server:
+            server.force_exit = True
+            server.should_exit = True
+            shutdown_event.set()
+    except Exception as e:
+        print(f"\nError occurred: {e}")
+    finally:
+        # Final cleanup
+        if server:
+            server.force_exit = True
+            server.should_exit = True
+            shutdown_event.set()
+        print("\nServer shutdown complete.")
